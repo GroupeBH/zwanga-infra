@@ -1,0 +1,141 @@
+---
+- name: Provision NestJS + Caddy on EC2
+  hosts: app
+  become: true
+  vars:
+    app_dir: /opt/nestjs-caddy
+    deploy_user: "{{ ansible_user | default('ubuntu') }}"
+    domain: "{{ domain | default('') }}"
+    caddy_email: "{{ caddy_email | default('') }}"
+    admin_cidr: "{{ admin_cidr }}"
+    backend_dir: "{{ app_dir }}/app"
+
+  pre_tasks:
+    - name: Validate backend repository input
+      ansible.builtin.assert:
+        that:
+          - backend_repo is defined
+          - backend_repo | length > 0
+        fail_msg: "backend_repo is required (example: https://github.com/your-org/your-backend.git)."
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - gnupg
+          - lsb-release
+          - ufw
+        state: present
+
+    - name: Add Docker apt key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker packages
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker is enabled and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add deploy user to docker group
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        groups: docker
+        append: true
+
+    - name: Reset UFW rules
+      ansible.builtin.command: ufw --force reset
+
+    - name: Default deny incoming
+      ansible.builtin.command: ufw default deny incoming
+
+    - name: Default allow outgoing
+      ansible.builtin.command: ufw default allow outgoing
+
+    - name: Allow SSH only from personal IP
+      ansible.builtin.command: "ufw allow from {{ admin_cidr }} to any port 22 proto tcp"
+
+    - name: Allow HTTP
+      ansible.builtin.command: ufw allow 80/tcp
+
+    - name: Allow HTTPS
+      ansible.builtin.command: ufw allow 443/tcp
+
+    - name: Enable UFW
+      ansible.builtin.command: ufw --force enable
+
+    - name: Ensure application directory exists
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0755"
+
+    - name: Clone or update backend repository
+      ansible.builtin.git:
+        repo: "{{ backend_repo }}"
+        dest: "{{ backend_dir }}"
+        version: "{{ backend_ref | default('main') }}"
+        update: true
+        force: true
+        accept_hostkey: true
+      become: true
+      become_user: "{{ deploy_user }}"
+
+    - name: Render docker-compose
+      ansible.builtin.template:
+        src: files/docker-compose.yml.j2
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0644"
+
+    - name: Render Caddyfile
+      ansible.builtin.template:
+        src: files/Caddyfile.j2
+        dest: "{{ app_dir }}/Caddyfile"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0644"
+
+    - name: Build and start containers
+      ansible.builtin.command: docker compose up -d --build
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Wait for app health endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:3000/health
+        method: GET
+        status_code: 200
+      register: healthcheck
+      retries: 20
+      delay: 5
+      until: healthcheck.status == 200

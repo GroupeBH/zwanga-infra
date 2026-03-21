@@ -1,0 +1,131 @@
+name: Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: Git ref of the Nest.js backend to deploy
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - deploy-nest-api
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: zwanga-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+      TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+      TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+      BACKEND_REPO: ${{ vars.BACKEND_REPO }}
+      DEFAULT_BACKEND_REF: ${{ vars.BACKEND_REF }}
+      EVENT_BACKEND_REF: ${{ github.event.inputs.backend_ref }}
+      PAYLOAD_BACKEND_REF: ${{ github.event.client_payload.backend_ref }}
+      TF_VARS_FILE: ${{ github.workspace }}/terraform/terraform.tfvars
+      TF_BACKEND_CONFIG_FILE: ${{ github.workspace }}/terraform/backend.hcl
+      PRIVATE_KEY_PATH: ${{ github.workspace }}/.tmp/zwanga.pem
+      TFVARS_CONTENT: ${{ secrets.TFVARS_CONTENT }}
+      TF_BACKEND_CONFIG_CONTENT: ${{ secrets.TF_BACKEND_CONFIG_CONTENT }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Write backend config, tfvars, and SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$PRIVATE_KEY_PATH")"
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$PRIVATE_KEY_PATH"
+          chmod 600 "$PRIVATE_KEY_PATH"
+
+          if [[ -n "${TF_BACKEND_CONFIG_CONTENT}" ]]; then
+            printf '%s\n' "$TF_BACKEND_CONFIG_CONTENT" > "$TF_BACKEND_CONFIG_FILE"
+          fi
+
+          if [[ -n "${TFVARS_CONTENT}" ]]; then
+            printf '%s\n' "$TFVARS_CONTENT" > "$TF_VARS_FILE"
+          fi
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AWS_REGION:?Configure repository variable AWS_REGION}"
+          : "${EC2_SSH_PRIVATE_KEY:?Configure secret EC2_SSH_PRIVATE_KEY}"
+
+          if [[ -z "${TF_BACKEND_CONFIG_CONTENT}" && -z "${TF_STATE_BUCKET}" ]]; then
+            echo "Configure either secret TF_BACKEND_CONFIG_CONTENT or variable TF_STATE_BUCKET for the Terraform backend."
+            exit 1
+          fi
+
+      - name: Deploy with Terraform and Ansible
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          effective_backend_ref="${EVENT_BACKEND_REF:-}"
+          if [[ -z "${effective_backend_ref}" ]]; then
+            effective_backend_ref="${PAYLOAD_BACKEND_REF:-}"
+          fi
+          if [[ -z "${effective_backend_ref}" ]]; then
+            effective_backend_ref="${DEFAULT_BACKEND_REF:-main}"
+          fi
+
+          chmod +x ./deploy.sh
+
+          args=(
+            --private-key "$PRIVATE_KEY_PATH"
+          )
+
+          if [[ -n "${TF_STATE_BUCKET:-}" ]]; then
+            args+=(--tf-state-bucket "$TF_STATE_BUCKET")
+          fi
+          if [[ -n "${TF_STATE_KEY:-}" ]]; then
+            args+=(--tf-state-key "$TF_STATE_KEY")
+          fi
+          if [[ -n "${TF_STATE_REGION:-}" ]]; then
+            args+=(--tf-state-region "$TF_STATE_REGION")
+          fi
+          if [[ -n "${TF_LOCK_TABLE:-}" ]]; then
+            args+=(--tf-lock-table "$TF_LOCK_TABLE")
+          fi
+          if [[ -n "${BACKEND_REPO:-}" ]]; then
+            args+=(--backend-repo "$BACKEND_REPO")
+          fi
+          if [[ -n "${effective_backend_ref:-}" ]]; then
+            args+=(--backend-ref "$effective_backend_ref")
+          fi
+
+          ./deploy.sh "${args[@]}"

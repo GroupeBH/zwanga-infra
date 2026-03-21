@@ -1,0 +1,10 @@
+terraform/.terraform/
+terraform/.terraform.tfstate.lock.info
+terraform/terraform.tfstate
+terraform/terraform.tfstate.*
+terraform/terraform.tfvars
+terraform/backend.hcl
+ansible/inventory.ini
+app/node_modules/
+app/dist/
+*.pem

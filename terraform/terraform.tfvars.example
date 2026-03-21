@@ -1,0 +1,32 @@
+# Copy this file to terraform/terraform.tfvars and replace the placeholder values.
+# This file is for Terraform infra inputs only.
+# Keep app env vars like DATABASE_URL and REDIS_URL outside Terraform.
+
+# AWS
+aws_region        = "us-east-1"
+availability_zone = "us-east-1a"
+
+# Network
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+
+# Compute
+ami_id        = ""
+instance_type = "t3.micro"
+key_name      = "CHANGE_ME_EC2_KEYPAIR"
+admin_cidr    = "203.0.113.10/32"
+instance_name = "zwanga-api"
+
+# Public access
+domain_name = ""
+caddy_email = ""
+
+# Nest.js source repository
+backend_repo = "https://github.com/your-org/your-nestjs-repo.git"
+backend_ref  = "main"
+
+# Logs
+log_retention_days = 14
+
+# Optional AWS SSM parameters
+ssm_secure_parameters = {}
