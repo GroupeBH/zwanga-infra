@@ -7,8 +7,7 @@ terraform/backend.hcl
 ansible/inventory.ini
 app/node_modules/
 app/dist/
-*.pem
-app/.env.production
 .env
 .env.*
-!app/.env.production.example
+app/.env.production
+*.pem

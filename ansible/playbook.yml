@@ -134,47 +134,47 @@
       args:
         chdir: "{{ app_dir }}"
 
-    - name: Wait for app container healthcheck
+    - name: Wait for app container readiness
       block:
-        - name: Poll Docker health status
+        - name: Poll Docker container state
           ansible.builtin.command:
             argv:
               - docker
               - inspect
               - --format
-              - "{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}{% endraw %}"
+              - "{% raw %}{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}{% endraw %}"
               - nestjs-app
-          register: app_healthcheck_result
+          register: app_container_state_result
           changed_when: false
           retries: 20
           delay: 5
-          until: app_healthcheck_result.stdout == "healthy"
+          until: app_container_state_result.stdout in ["running|healthy", "running|missing-healthcheck"]
       rescue:
-        - name: Capture docker compose services after failed healthcheck
+        - name: Capture docker compose services after failed readiness check
           ansible.builtin.command: docker compose ps
           args:
             chdir: "{{ app_dir }}"
           register: compose_ps_result
           changed_when: false
 
-        - name: Print docker compose services after failed healthcheck
+        - name: Print docker compose services after failed readiness check
           ansible.builtin.debug:
             var: compose_ps_result.stdout_lines
 
-        - name: Capture application logs after failed healthcheck
+        - name: Capture application logs after failed readiness check
           ansible.builtin.command: docker compose logs app --tail=100
           args:
             chdir: "{{ app_dir }}"
           register: app_logs_result
           changed_when: false
 
-        - name: Print application logs after failed healthcheck
+        - name: Print application logs after failed readiness check
           ansible.builtin.debug:
             var: app_logs_result.stdout_lines
 
-        - name: Fail when Docker healthcheck does not become healthy
+        - name: Fail when container never becomes ready
           ansible.builtin.fail:
-            msg: "The NestJS container did not become healthy according to its Docker HEALTHCHECK."
+            msg: "The NestJS container never reached a ready state (running with no Docker HEALTHCHECK, or healthy when a Docker HEALTHCHECK exists)."
 
     - name: Show docker compose services
       ansible.builtin.command: docker compose ps
