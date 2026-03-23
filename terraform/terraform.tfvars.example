@@ -21,9 +21,9 @@ instance_name = "zwanga-api"
 domain_name = ""
 caddy_email = ""
 
-# Nest.js source repository
-backend_repo = "https://github.com/your-org/your-nestjs-repo.git"
-backend_ref  = "main"
+# Nest.js Docker image
+app_image_repository = "your-org/zwanga"
+app_image_tag        = "latest"
 
 # Logs
 log_retention_days = 14

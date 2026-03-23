@@ -53,4 +53,4 @@ jobs:
             -i ansible/inventory.ini \
             ansible/playbook.yml \
             --syntax-check \
-            --extra-vars "admin_cidr=203.0.113.10/32 backend_repo=https://github.com/example/example.git backend_ref=main"
+            --extra-vars "admin_cidr=203.0.113.10/32 app_image_repository=example/zwanga app_image_tag=latest"

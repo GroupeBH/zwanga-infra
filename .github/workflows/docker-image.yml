@@ -1,0 +1,69 @@
+name: Build Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**"
+      - ".github/workflows/docker-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      APP_IMAGE_REPOSITORY: ${{ vars.APP_IMAGE_REPOSITORY }}
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Hub configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${APP_IMAGE_REPOSITORY:?Configure repository variable APP_IMAGE_REPOSITORY}"
+          : "${DOCKERHUB_USERNAME:?Configure repository variable DOCKERHUB_USERNAME}"
+          : "${DOCKERHUB_TOKEN:?Configure repository secret DOCKERHUB_TOKEN}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Prepare image tags
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="docker.io/${APP_IMAGE_REPOSITORY}:${GITHUB_SHA}"
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tags="${tags},docker.io/${APP_IMAGE_REPOSITORY}:latest"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.prep.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print deploy tag
+        shell: bash
+        run: |
+          echo "Pushed docker.io/${APP_IMAGE_REPOSITORY}:${{ steps.prep.outputs.deploy_tag }}"

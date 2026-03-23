@@ -3,8 +3,8 @@ name: Deploy Infrastructure
 on:
   workflow_dispatch:
     inputs:
-      backend_ref:
-        description: Git ref of the Nest.js backend to deploy
+      app_image_tag:
+        description: Docker image tag of the Nest.js app to deploy
         required: false
         type: string
   repository_dispatch:
@@ -28,10 +28,12 @@ jobs:
       TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
       TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
       TF_LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-      BACKEND_REPO: ${{ vars.BACKEND_REPO }}
-      DEFAULT_BACKEND_REF: ${{ vars.BACKEND_REF }}
-      EVENT_BACKEND_REF: ${{ github.event.inputs.backend_ref }}
-      PAYLOAD_BACKEND_REF: ${{ github.event.client_payload.backend_ref }}
+      APP_IMAGE_REPOSITORY: ${{ vars.APP_IMAGE_REPOSITORY }}
+      DEFAULT_APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}
+      EVENT_APP_IMAGE_TAG: ${{ github.event.inputs.app_image_tag }}
+      PAYLOAD_APP_IMAGE_TAG: ${{ github.event.client_payload.app_image_tag }}
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       TF_VARS_FILE: ${{ github.workspace }}/terraform/terraform.tfvars
       TF_BACKEND_CONFIG_FILE: ${{ github.workspace }}/terraform/backend.hcl
       PRIVATE_KEY_PATH: ${{ github.workspace }}/.tmp/zwanga.pem
@@ -95,12 +97,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          effective_backend_ref="${EVENT_BACKEND_REF:-}"
-          if [[ -z "${effective_backend_ref}" ]]; then
-            effective_backend_ref="${PAYLOAD_BACKEND_REF:-}"
+          effective_app_image_tag="${EVENT_APP_IMAGE_TAG:-}"
+          if [[ -z "${effective_app_image_tag}" ]]; then
+            effective_app_image_tag="${PAYLOAD_APP_IMAGE_TAG:-}"
           fi
-          if [[ -z "${effective_backend_ref}" ]]; then
-            effective_backend_ref="${DEFAULT_BACKEND_REF:-main}"
+          if [[ -z "${effective_app_image_tag}" ]]; then
+            effective_app_image_tag="${DEFAULT_APP_IMAGE_TAG:-latest}"
           fi
 
           chmod +x ./deploy.sh
@@ -121,11 +123,11 @@ jobs:
           if [[ -n "${TF_LOCK_TABLE:-}" ]]; then
             args+=(--tf-lock-table "$TF_LOCK_TABLE")
           fi
-          if [[ -n "${BACKEND_REPO:-}" ]]; then
-            args+=(--backend-repo "$BACKEND_REPO")
+          if [[ -n "${APP_IMAGE_REPOSITORY:-}" ]]; then
+            args+=(--app-image-repository "$APP_IMAGE_REPOSITORY")
           fi
-          if [[ -n "${effective_backend_ref:-}" ]]; then
-            args+=(--backend-ref "$effective_backend_ref")
+          if [[ -n "${effective_app_image_tag:-}" ]]; then
+            args+=(--app-image-tag "$effective_app_image_tag")
           fi
 
           ./deploy.sh "${args[@]}"

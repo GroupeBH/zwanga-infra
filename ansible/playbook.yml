@@ -5,18 +5,29 @@
   vars:
     app_dir: /opt/nestjs-caddy
     deploy_user: "{{ ansible_user | default('ubuntu') }}"
-    domain: "{{ domain | default('') }}"
-    caddy_email: "{{ caddy_email | default('') }}"
-    admin_cidr: "{{ admin_cidr }}"
-    backend_dir: "{{ app_dir }}/app"
+    dockerhub_username: "{{ lookup('env', 'DOCKERHUB_USERNAME') | default('', true) }}"
+    dockerhub_token: "{{ lookup('env', 'DOCKERHUB_TOKEN') | default('', true) }}"
 
   pre_tasks:
-    - name: Validate backend repository input
+    - name: Validate app image repository input
       ansible.builtin.assert:
         that:
-          - backend_repo is defined
-          - backend_repo | length > 0
-        fail_msg: "backend_repo is required (example: https://github.com/your-org/your-backend.git)."
+          - app_image_repository is defined
+          - app_image_repository | length > 0
+        fail_msg: "app_image_repository is required (example: your-org/zwanga)."
+
+    - name: Validate admin CIDR input
+      ansible.builtin.assert:
+        that:
+          - admin_cidr is defined
+          - admin_cidr | length > 0
+        fail_msg: "admin_cidr is required."
+
+    - name: Validate Docker Hub credentials completeness
+      ansible.builtin.assert:
+        that:
+          - (dockerhub_username | length == 0 and dockerhub_token | length == 0) or (dockerhub_username | length > 0 and dockerhub_token | length > 0)
+        fail_msg: "Set both DOCKERHUB_USERNAME and DOCKERHUB_TOKEN together, or leave both unset."
 
   tasks:
     - name: Update apt cache
@@ -29,7 +40,6 @@
         name:
           - ca-certificates
           - curl
-          - git
           - gnupg
           - lsb-release
           - ufw
@@ -42,7 +52,7 @@
 
     - name: Add Docker apt repository
       ansible.builtin.apt_repository:
-        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable"
         state: present
         filename: docker
 
@@ -69,6 +79,114 @@
         groups: docker
         append: true
 
+    - name: Ensure application directory exists
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0755"
+
+    - name: Render docker-compose
+      ansible.builtin.template:
+        src: files/docker-compose.yml.j2
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0644"
+
+    - name: Render Caddyfile
+      ansible.builtin.template:
+        src: files/Caddyfile.j2
+        dest: "{{ app_dir }}/Caddyfile"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0644"
+
+    - name: Copy app env file when provided
+      ansible.builtin.copy:
+        src: "{{ app_env_file }}"
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+      when: app_env_file is defined and app_env_file | length > 0
+
+    - name: Log in to Docker Hub when credentials are provided
+      ansible.builtin.command:
+        argv:
+          - docker
+          - login
+          - --username
+          - "{{ dockerhub_username }}"
+          - --password-stdin
+        stdin: "{{ dockerhub_token }}"
+      no_log: true
+      when: dockerhub_username | length > 0
+
+    - name: Pull application image
+      ansible.builtin.command: docker compose pull app
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Start containers
+      ansible.builtin.command: docker compose up -d --remove-orphans
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Wait for app container healthcheck
+      block:
+        - name: Poll Docker health status
+          ansible.builtin.command:
+            argv:
+              - docker
+              - inspect
+              - --format
+              - "{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}{% endraw %}"
+              - nestjs-app
+          register: app_healthcheck_result
+          changed_when: false
+          retries: 20
+          delay: 5
+          until: app_healthcheck_result.stdout == "healthy"
+      rescue:
+        - name: Capture docker compose services after failed healthcheck
+          ansible.builtin.command: docker compose ps
+          args:
+            chdir: "{{ app_dir }}"
+          register: compose_ps_result
+          changed_when: false
+
+        - name: Print docker compose services after failed healthcheck
+          ansible.builtin.debug:
+            var: compose_ps_result.stdout_lines
+
+        - name: Capture application logs after failed healthcheck
+          ansible.builtin.command: docker compose logs app --tail=100
+          args:
+            chdir: "{{ app_dir }}"
+          register: app_logs_result
+          changed_when: false
+
+        - name: Print application logs after failed healthcheck
+          ansible.builtin.debug:
+            var: app_logs_result.stdout_lines
+
+        - name: Fail when Docker healthcheck does not become healthy
+          ansible.builtin.fail:
+            msg: "The NestJS container did not become healthy according to its Docker HEALTHCHECK."
+
+    - name: Show docker compose services
+      ansible.builtin.command: docker compose ps
+      args:
+        chdir: "{{ app_dir }}"
+      register: compose_ps_result
+      changed_when: false
+
+    - name: Print docker compose services
+      ansible.builtin.debug:
+        var: compose_ps_result.stdout_lines
+
     - name: Reset UFW rules
       ansible.builtin.command: ufw --force reset
 
@@ -90,52 +208,10 @@
     - name: Enable UFW
       ansible.builtin.command: ufw --force enable
 
-    - name: Ensure application directory exists
-      ansible.builtin.file:
-        path: "{{ app_dir }}"
-        state: directory
-        owner: "{{ deploy_user }}"
-        group: "{{ deploy_user }}"
-        mode: "0755"
+    - name: Reset SSH connection after firewall changes
+      ansible.builtin.meta: reset_connection
 
-    - name: Clone or update backend repository
-      ansible.builtin.git:
-        repo: "{{ backend_repo }}"
-        dest: "{{ backend_dir }}"
-        version: "{{ backend_ref | default('main') }}"
-        update: true
-        force: true
-        accept_hostkey: true
-      become: true
-      become_user: "{{ deploy_user }}"
-
-    - name: Render docker-compose
-      ansible.builtin.template:
-        src: files/docker-compose.yml.j2
-        dest: "{{ app_dir }}/docker-compose.yml"
-        owner: "{{ deploy_user }}"
-        group: "{{ deploy_user }}"
-        mode: "0644"
-
-    - name: Render Caddyfile
-      ansible.builtin.template:
-        src: files/Caddyfile.j2
-        dest: "{{ app_dir }}/Caddyfile"
-        owner: "{{ deploy_user }}"
-        group: "{{ deploy_user }}"
-        mode: "0644"
-
-    - name: Build and start containers
-      ansible.builtin.command: docker compose up -d --build
-      args:
-        chdir: "{{ app_dir }}"
-
-    - name: Wait for app health endpoint
-      ansible.builtin.uri:
-        url: http://127.0.0.1:3000/health
-        method: GET
-        status_code: 200
-      register: healthcheck
-      retries: 20
-      delay: 5
-      until: healthcheck.status == 200
+    - name: Confirm SSH after firewall changes
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 60

@@ -53,14 +53,14 @@ output "deploy_admin_cidr" {
   value       = var.admin_cidr
 }
 
-output "deploy_backend_repo" {
-  description = "Backend Git repository URL used by Ansible."
-  value       = var.backend_repo
+output "deploy_app_image_repository" {
+  description = "Docker Hub image repository used by Ansible."
+  value       = var.app_image_repository
 }
 
-output "deploy_backend_ref" {
-  description = "Backend Git ref used by Ansible."
-  value       = var.backend_ref
+output "deploy_app_image_tag" {
+  description = "Docker image tag used by Ansible."
+  value       = var.app_image_tag
 }
 
 output "deploy_caddy_email" {

@@ -1,13 +1,15 @@
 services:
   app:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
+    image: "{{ app_image_repository }}:{{ app_image_tag | default('latest') }}"
     container_name: nestjs-app
     restart: unless-stopped
     environment:
       NODE_ENV: production
       PORT: "3000"
+{% if app_env_file is defined and app_env_file | length > 0 %}
+    env_file:
+      - ./.env
+{% endif %}
     ports:
       - "127.0.0.1:3000:3000"
     networks:

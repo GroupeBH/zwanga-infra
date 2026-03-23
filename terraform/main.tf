@@ -129,7 +129,7 @@ resource "aws_security_group" "web" {
 
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
-    effect = "Allow"
+    effect  = "Allow"
     actions = ["sts:AssumeRole"]
 
     principals {

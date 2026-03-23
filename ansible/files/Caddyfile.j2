@@ -1,11 +1,13 @@
-{% if domain | length > 0 %}
-{% if caddy_email | length > 0 %}
+{% set app_domain = domain | default('') %}
+{% set contact_email = caddy_email | default('') %}
+{% if app_domain | length > 0 %}
+{% if contact_email | length > 0 %}
 {
-  email {{ caddy_email }}
+  email {{ contact_email }}
 }
 {% endif %}
 
-{{ domain }} {
+{{ app_domain }} {
   encode zstd gzip
   reverse_proxy app:3000
 }

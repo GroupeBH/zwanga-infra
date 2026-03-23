@@ -67,16 +67,16 @@ variable "caddy_email" {
   default     = ""
 }
 
-variable "backend_repo" {
-  description = "Git repository URL for the NestJS backend deployed by Ansible."
+variable "app_image_repository" {
+  description = "Docker Hub repository for the NestJS image deployed by Ansible."
   type        = string
   default     = ""
 }
 
-variable "backend_ref" {
-  description = "Git ref (branch, tag, or commit) for the NestJS backend."
+variable "app_image_tag" {
+  description = "Docker image tag deployed by Ansible."
   type        = string
-  default     = "main"
+  default     = "latest"
 }
 
 variable "log_retention_days" {

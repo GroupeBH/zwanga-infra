@@ -1,6 +1,6 @@
 # Zwanga Infra
 
-This repository provisions an EC2 VM with Terraform, then deploys a Nest.js API behind Caddy with Ansible.
+This repository provisions an EC2 VM with Terraform, then deploys a Nest.js API behind Caddy with Ansible by pulling a prebuilt Docker image from Docker Hub.
 
 ## tfvars
 
@@ -10,12 +10,12 @@ Important values to fill in:
 
 - `key_name`: existing EC2 key pair name
 - `admin_cidr`: your public IP in `/32` format
-- `backend_repo`: GitHub URL of the Nest.js repository to deploy
-- `backend_ref`: branch, tag, or commit to deploy
+- `app_image_repository`: Docker Hub repository to deploy
+- `app_image_tag`: Docker image tag to deploy
 - `domain_name`: optional
 - `caddy_email`: optional
 
-Assumption: the GitHub repository referenced by `backend_repo` has the Nest.js app at its root, with its own `Dockerfile`, `package.json`, and `src/`.
+Assumption: the Docker Hub repository referenced by `app_image_repository` contains a production-ready Nest.js image for the EC2 target architecture.
 
 ## Terraform Backend
 
@@ -64,15 +64,31 @@ PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
 You can still override any tfvars value with environment variables or CLI flags, for example:
 
 ```bash
-BACKEND_REF=main ./deploy.sh --private-key ~/.ssh/zwanga.pem
+APP_IMAGE_TAG=latest ./deploy.sh --private-key ~/.ssh/zwanga.pem
+```
+
+For immediate app secret injection without GitHub Actions, you can also pass a local env file that will be copied to the server and loaded by Docker Compose:
+
+```bash
+APP_ENV_FILE=./app/.env.production \
+PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+./deploy.sh
+```
+
+You can do the same with the CLI flag:
+
+```bash
+PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+./deploy.sh --app-env-file ./app/.env.production
 ```
 
 ## GitHub Actions
 
-Two workflows are included in [`.github/workflows`](.github/workflows):
+Three workflows are included in [`.github/workflows`](.github/workflows):
 
 - [`infra-ci.yml`](.github/workflows/infra-ci.yml): validates Terraform and Ansible syntax
 - [`deploy.yml`](.github/workflows/deploy.yml): deploys infrastructure and the Nest.js app with Terraform plus Ansible
+- [`docker-image.yml`](.github/workflows/docker-image.yml): builds and pushes the Nest.js image to Docker Hub
 
 ### Variables And Secrets For The Infra Repository
 
@@ -83,8 +99,9 @@ GitHub Actions variables:
 - `TF_STATE_KEY` optional
 - `TF_STATE_REGION` optional
 - `TF_LOCK_TABLE` optional
-- `BACKEND_REPO` optional if already present inside `TFVARS_CONTENT`
-- `BACKEND_REF` optional
+- `APP_IMAGE_REPOSITORY` optional if already present inside `TFVARS_CONTENT`
+- `APP_IMAGE_TAG` optional, defaults to `latest`
+- `DOCKERHUB_USERNAME` optional, needed for Docker image publishing or private image pulls
 
 GitHub Actions secrets:
 
@@ -92,50 +109,25 @@ GitHub Actions secrets:
 - `EC2_SSH_PRIVATE_KEY`: SSH private key used by Ansible
 - `TFVARS_CONTENT`: full production content of `terraform.tfvars`
 - `TF_BACKEND_CONFIG_CONTENT`: optional full content of `backend.hcl`
+- `DOCKERHUB_TOKEN`: optional, needed for Docker image publishing or private image pulls
 
 ### Recommended CI/CD Split
 
 The cleanest setup is to separate responsibilities:
 
-1. Nest.js repository
-   - CI on `pull_request` and `push`
-   - `npm ci`
-   - `npm run build`
-   - `npm run test --if-present`
+1. Image build
+   - build the Nest.js image from [`app`](app)
+   - push `docker.io/<APP_IMAGE_REPOSITORY>:<tag>` to Docker Hub
+   - use immutable tags such as the Git commit SHA for deployments
 
 2. Infra repository
    - CD through [`deploy.yml`](.github/workflows/deploy.yml)
    - manual runs with `workflow_dispatch`
-   - or automatic runs through `repository_dispatch` after a merge in the Nest.js repository
+   - or automatic runs through `repository_dispatch` with the image tag to deploy
 
-### Minimal Workflow For The Nest.js Repository
+### Trigger Infra Deployment With A Docker Image Tag
 
-```yaml
-name: Nest CI
-
-on:
-  pull_request:
-  push:
-    branches:
-      - main
-
-jobs:
-  ci:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - run: npm run test --if-present
-```
-
-### Trigger Infra Deployment From The Nest.js Repository
-
-After a merge on `main`, the Nest.js repository can call `repository_dispatch` on the infra repository to request a deployment of the current commit:
+After an image is pushed, any workflow can call `repository_dispatch` on the infra repository to request deployment of that exact tag:
 
 ```yaml
 - name: Trigger infra deploy
@@ -148,7 +140,7 @@ After a merge on `main`, the Nest.js repository can call `repository_dispatch` o
       -H "Accept: application/vnd.github+json" \
       -H "Authorization: Bearer ${INFRA_REPO_TOKEN}" \
       https://api.github.com/repos/OWNER/INFRA_REPO/dispatches \
-      -d "{\"event_type\":\"deploy-nest-api\",\"client_payload\":{\"backend_ref\":\"${GITHUB_SHA}\"}}"
+      -d "{\"event_type\":\"deploy-nest-api\",\"client_payload\":{\"app_image_tag\":\"${GITHUB_SHA}\"}}"
 ```
 
 The `INFRA_REPO_TOKEN` PAT must have access to the infra repository so it can trigger the workflow.
