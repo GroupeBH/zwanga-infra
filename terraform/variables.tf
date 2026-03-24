@@ -5,9 +5,15 @@ variable "aws_region" {
 }
 
 variable "availability_zone" {
-  description = "Optional AZ override (example: us-east-1a)."
+  description = "Optional primary AZ override (example: us-east-1a)."
   type        = string
   default     = "us-east-1a"
+}
+
+variable "secondary_availability_zone" {
+  description = "Optional secondary AZ override (example: us-east-1b). Leave empty to auto-pick another AZ when available."
+  type        = string
+  default     = ""
 }
 
 variable "vpc_cidr" {
@@ -17,9 +23,20 @@ variable "vpc_cidr" {
 }
 
 variable "public_subnet_cidr" {
-  description = "Public subnet CIDR block."
+  description = "Primary public subnet CIDR block."
   type        = string
   default     = "10.0.1.0/24"
+}
+
+variable "secondary_public_subnet_cidr" {
+  description = "Secondary public subnet CIDR block used by the failover EC2 node."
+  type        = string
+  default     = "10.0.2.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.secondary_public_subnet_cidr, 0))
+    error_message = "secondary_public_subnet_cidr must be a valid CIDR block."
+  }
 }
 
 variable "ami_id" {
@@ -32,6 +49,12 @@ variable "instance_type" {
   description = "EC2 instance type."
   type        = string
   default     = "t3.micro"
+}
+
+variable "secondary_instance_enabled" {
+  description = "When true, provisions a second EC2 node in another AZ for low-cost active-passive failover."
+  type        = bool
+  default     = true
 }
 
 variable "key_name" {
@@ -79,10 +102,27 @@ variable "app_image_tag" {
   default     = "latest"
 }
 
+variable "app_healthcheck_path" {
+  description = "Optional public health path shown in Terraform outputs and documentation."
+  type        = string
+  default     = "/health"
+
+  validation {
+    condition     = startswith(var.app_healthcheck_path, "/")
+    error_message = "app_healthcheck_path must start with '/'."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch log retention period in days."
   type        = number
   default     = 14
+}
+
+variable "alarm_email_endpoints" {
+  description = "Optional email recipients subscribed to CloudWatch/SNS alerts for instance failures."
+  type        = list(string)
+  default     = []
 }
 
 variable "ssm_secure_parameters" {

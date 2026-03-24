@@ -1,21 +1,68 @@
 # Zwanga Infra
 
-This repository provisions an EC2 VM with Terraform, then deploys a Nest.js API behind Caddy with Ansible by pulling a prebuilt Docker image from Docker Hub.
+This repository provisions a low-cost active-passive AWS deployment for the Zwanga Nest.js API.
+Terraform creates the infrastructure, then Ansible deploys a prebuilt Docker Hub image behind Caddy on one primary EC2 node and one secondary failover EC2 node.
 
-## tfvars
+## Architecture
 
-A real `terraform/terraform.tfvars` file is now present, and a reusable template is available in [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example).
+```text
+Internet
+  -> External DNS provider
+     -> Primary public IP   -> EC2 primary   -> Caddy -> Nest.js image
+     -> Secondary public IP -> EC2 secondary -> Caddy -> Nest.js image
+```
 
-Important values to fill in:
+What this repo now provisions by default:
+
+- 1 VPC
+- 1 internet gateway
+- 2 public subnets in 2 AZs when available
+- 2 EC2 instances when `secondary_instance_enabled = true`
+- 2 Elastic IPs
+- 1 shared security group
+- 2 CloudWatch log groups (`/${instance_name}/app` and `/${instance_name}/caddy`)
+- 2 CloudWatch alarms per node for EC2 status checks
+- optional SNS email notifications for infra alerts
+- optional SSM Parameter Store secure parameters
+
+The design goal is simple:
+
+- keep the stack inexpensive
+- avoid the biggest single point of failure of a single EC2 node
+- stay compatible with an external DNS provider instead of Route 53
+
+## Read First
+
+Detailed documentation lives here:
+
+- [`docs/low-cost-failover.md`](docs/low-cost-failover.md): architecture, tradeoffs, DNS strategy, and HTTPS behavior
+- [`docs/manual-failover-runbook.md`](docs/manual-failover-runbook.md): operational runbook for failover, failback, and incident handling
+
+If you only read one warning before deploying, read this one:
+
+> In this low-cost design, HTTPS on the passive node is the main operational tradeoff.
+> With Caddy using ACME HTTP/TLS challenges and an external DNS provider pointing to the primary node, the secondary node may not be able to pre-issue the same public certificate until DNS is switched to it.
+> This is acceptable for low-cost failover, but it is not as seamless as an ALB-based architecture.
+
+## Terraform Inputs
+
+A reusable template is available in [`terraform/terraform.tfvars.example`](terraform/terraform.tfvars.example).
+
+Important values:
 
 - `key_name`: existing EC2 key pair name
 - `admin_cidr`: your public IP in `/32` format
 - `app_image_repository`: Docker Hub repository to deploy
 - `app_image_tag`: Docker image tag to deploy
-- `domain_name`: optional
-- `caddy_email`: optional
+- `secondary_instance_enabled`: enables the second failover node, defaults to `true`
+- `secondary_availability_zone`: optional manual override for the failover AZ
+- `secondary_public_subnet_cidr`: CIDR block for the failover subnet
+- `domain_name`: optional public domain served by Caddy
+- `caddy_email`: optional ACME contact email
+- `app_healthcheck_path`: only used for outputs/documentation, not for deployment gating
+- `alarm_email_endpoints`: optional email recipients for CloudWatch/SNS alerts
 
-Assumption: the Docker Hub repository referenced by `app_image_repository` contains a production-ready Nest.js image for the EC2 target architecture.
+Assumption: `app_image_repository` points to a production-ready Nest.js image for the EC2 target architecture.
 
 ## Terraform Backend
 
@@ -23,9 +70,9 @@ The Terraform S3 backend does not belong in `terraform.tfvars`.
 Terraform reads the backend during `terraform init`, before it loads normal input variables.
 That is why the S3 bucket has to live in a dedicated backend file or in `-backend-config` arguments.
 
-A local backend file is now included in [`terraform/backend.hcl`](terraform/backend.hcl), with a matching template in [`terraform/backend.hcl.example`](terraform/backend.hcl.example).
+Use [`terraform/backend.hcl`](terraform/backend.hcl) locally, or create it from [`terraform/backend.hcl.example`](terraform/backend.hcl.example).
 
-Example backend file:
+Example:
 
 ```hcl
 bucket  = "my-tf-state-bucket"
@@ -42,7 +89,7 @@ encrypt = true
 - `terraform/terraform.tfvars` when present
 - `terraform/backend.hcl` when present
 
-CLI flags or environment variables can still override these files.
+CLI flags or environment variables can override those values.
 
 Example:
 
@@ -61,13 +108,15 @@ PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
 ./deploy.sh
 ```
 
-You can still override any tfvars value with environment variables or CLI flags, for example:
+Override the image tag directly when you want to deploy a specific build:
 
 ```bash
-APP_IMAGE_TAG=latest ./deploy.sh --private-key ~/.ssh/zwanga.pem
+APP_IMAGE_TAG=2026-03-23-sha123 \
+PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+./deploy.sh
 ```
 
-For immediate app secret injection without GitHub Actions, you can also pass a local env file that will be copied to the server and loaded by Docker Compose:
+Inject an app env file from your workstation without going through GitHub Actions:
 
 ```bash
 APP_ENV_FILE=./app/.env.production \
@@ -75,12 +124,66 @@ PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
 ./deploy.sh
 ```
 
-You can do the same with the CLI flag:
+`deploy.sh` now builds an Ansible inventory with a `primary` host and, when enabled, a `secondary` host.
+The playbook deploys serially to reduce blast radius during rollouts.
 
-```bash
-PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
-./deploy.sh --app-env-file ./app/.env.production
-```
+## External DNS Strategy
+
+This stack intentionally assumes your DNS is hosted outside AWS.
+
+Recommended setup:
+
+- create a public record such as `api.example.com`
+- point it to the primary Elastic IP in normal operation
+- keep the secondary Elastic IP documented as the standby target
+- set a low TTL, typically `60` or `120` seconds
+- if your DNS provider supports automated failover/health checks, use the two Terraform outputs as primary/secondary targets
+- otherwise use the manual runbook in [`docs/manual-failover-runbook.md`](docs/manual-failover-runbook.md)
+
+Terraform outputs expose the values you need:
+
+- `deploy_primary_public_ip`
+- `deploy_secondary_public_ip`
+- `external_dns_failover_targets`
+- `ssh_commands`
+
+## HTTPS And Caddy
+
+Caddy automatically serves HTTPS only when `domain_name` is configured.
+If `domain_name` is empty, Caddy serves plain HTTP on port 80.
+
+For HTTPS:
+
+1. create a DNS record at your external DNS provider that points to the primary Elastic IP
+2. set `domain_name`
+3. set `caddy_email`
+4. redeploy
+
+Important limitation of the low-cost failover model:
+
+- while DNS points at the primary node, the secondary node may not be able to complete public ACME validation for the same hostname
+- after a DNS cutover, Caddy on the secondary can retry certificate issuance
+- if you need seamless active-active HTTPS, move to an ALB-based design or use a certificate strategy that does not depend on traffic reaching a single node during issuance
+
+## CloudWatch Logs And Alarms
+
+Container logs are shipped through Docker's `awslogs` driver to the existing log groups:
+
+- `/${instance_name}/app`
+- `/${instance_name}/caddy`
+
+With the new multi-host inventory, streams are easier to read:
+
+- `app-primary`
+- `app-secondary`
+- `caddy-primary`
+- `caddy-secondary`
+
+The infra also creates:
+
+- a `StatusCheckFailed_System` alarm per node, with EC2 recovery action
+- a `StatusCheckFailed_Instance` alarm per node
+- optional SNS email subscriptions when `alarm_email_endpoints` is not empty
 
 ## GitHub Actions
 
@@ -111,36 +214,12 @@ GitHub Actions secrets:
 - `TF_BACKEND_CONFIG_CONTENT`: optional full content of `backend.hcl`
 - `DOCKERHUB_TOKEN`: optional, needed for Docker image publishing or private image pulls
 
-### Recommended CI/CD Split
+## Recommended CI/CD Split
 
-The cleanest setup is to separate responsibilities:
+The cleanest setup is still:
 
-1. Image build
-   - build the Nest.js image from [`app`](app)
-   - push `docker.io/<APP_IMAGE_REPOSITORY>:<tag>` to Docker Hub
-   - use immutable tags such as the Git commit SHA for deployments
+1. Build the Nest.js image from the application repository and push it to Docker Hub.
+2. Deploy immutable image tags from this infra repository.
+3. Keep infrastructure values in Terraform, and keep application secrets outside Terraform when possible.
 
-2. Infra repository
-   - CD through [`deploy.yml`](.github/workflows/deploy.yml)
-   - manual runs with `workflow_dispatch`
-   - or automatic runs through `repository_dispatch` with the image tag to deploy
-
-### Trigger Infra Deployment With A Docker Image Tag
-
-After an image is pushed, any workflow can call `repository_dispatch` on the infra repository to request deployment of that exact tag:
-
-```yaml
-- name: Trigger infra deploy
-  if: github.ref == 'refs/heads/main'
-  env:
-    INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
-  run: |
-    curl -L \
-      -X POST \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer ${INFRA_REPO_TOKEN}" \
-      https://api.github.com/repos/OWNER/INFRA_REPO/dispatches \
-      -d "{\"event_type\":\"deploy-nest-api\",\"client_payload\":{\"app_image_tag\":\"${GITHUB_SHA}\"}}"
-```
-
-The `INFRA_REPO_TOKEN` PAT must have access to the infra repository so it can trigger the workflow.
+A good deployment tag is the Git commit SHA, not `latest`.

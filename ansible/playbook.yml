@@ -1,6 +1,8 @@
 ---
 - name: Provision NestJS + Caddy on EC2
   hosts: app
+  serial: 1
+  any_errors_fatal: true
   become: true
   vars:
     app_dir: /opt/nestjs-caddy

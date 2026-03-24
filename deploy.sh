@@ -57,9 +57,9 @@ CLI arguments or environment variables override values from those files.
 
 Environment variable alternatives are also supported:
   AWS_REGION, KEY_NAME, PRIVATE_KEY_PATH, ADMIN_CIDR, DOMAIN, CADDY_EMAIL, INSTANCE_NAME,
-  INSTANCE_TYPE, APP_IMAGE_REPOSITORY, APP_IMAGE_TAG, APP_ENV_FILE, APP_HEALTHCHECK_PATH, TF_VARS_FILE, TF_BACKEND_CONFIG_FILE,
-  TF_STATE_BUCKET, TF_STATE_KEY, TF_STATE_REGION, TF_LOCK_TABLE, SSH_RETRIES,
-  SSH_RETRY_DELAY_SECONDS, SSH_CONNECT_TIMEOUT
+  INSTANCE_TYPE, APP_IMAGE_REPOSITORY, APP_IMAGE_TAG, APP_ENV_FILE, APP_HEALTHCHECK_PATH,
+  TF_VARS_FILE, TF_BACKEND_CONFIG_FILE, TF_STATE_BUCKET, TF_STATE_KEY, TF_STATE_REGION,
+  TF_LOCK_TABLE, SSH_RETRIES, SSH_RETRY_DELAY_SECONDS, SSH_CONNECT_TIMEOUT
 EOF
 }
 
@@ -212,8 +212,6 @@ if [[ "${APP_HEALTHCHECK_PATH}" != /* ]]; then
   exit 1
 fi
 
-# If the AWS provider is already present locally, use it as a filesystem mirror
-# to avoid flaky registry calls during repeated deploy runs.
 TF_PROVIDER_MIRROR_DIR="${TF_DIR}/.terraform/providers"
 shopt -s nullglob
 aws_provider_binaries=("${TF_PROVIDER_MIRROR_DIR}"/registry.terraform.io/hashicorp/aws/*/*/terraform-provider-aws_*)
@@ -274,6 +272,9 @@ fi
 if [[ -n "${APP_IMAGE_TAG}" ]]; then
   TF_APPLY_ARGS+=(-var "app_image_tag=${APP_IMAGE_TAG}")
 fi
+if [[ -n "${APP_HEALTHCHECK_PATH}" ]]; then
+  TF_APPLY_ARGS+=(-var "app_healthcheck_path=${APP_HEALTHCHECK_PATH}")
+fi
 
 echo "==> Terraform init"
 INIT_ARGS=(
@@ -302,7 +303,8 @@ terraform -chdir="${TF_DIR}" init "${INIT_ARGS[@]}"
 echo "==> Terraform apply"
 terraform -chdir="${TF_DIR}" apply "${TF_APPLY_ARGS[@]}"
 
-terraform_output_snapshot() {
+terraform_output_raw() {
+  local key="$1"
   local attempt=1
   local max_attempts=5
   local delay_seconds=3
@@ -310,8 +312,8 @@ terraform_output_snapshot() {
   local status=0
 
   while (( attempt <= max_attempts )); do
-    if output="$(terraform -chdir="${TF_DIR}" output -no-color 2>&1)"; then
-      printf '%s\n' "${output}"
+    if output="$(terraform -chdir="${TF_DIR}" output -raw "${key}" 2>&1)"; then
+      printf '%s' "${output}"
       return 0
     else
       status=$?
@@ -322,77 +324,93 @@ terraform_output_snapshot() {
       return "${status}"
     fi
 
-    echo "terraform output failed (attempt ${attempt}/${max_attempts}); retrying in ${delay_seconds}s..." >&2
+    echo "terraform output ${key} failed (attempt ${attempt}/${max_attempts}); retrying in ${delay_seconds}s..." >&2
     sleep "${delay_seconds}"
     delay_seconds=$(( delay_seconds * 2 ))
     attempt=$(( attempt + 1 ))
   done
 }
 
-extract_tf_output() {
-  local key="$1"
-  local value
-
-  value="$(printf '%s\n' "${TF_OUTPUTS}" | sed -n "s/^${key} = //p" | head -n 1)"
-  value="${value#\"}"
-  value="${value%\"}"
-  printf '%s' "${value}"
-}
-
 echo "==> Loading Terraform outputs"
-TF_OUTPUTS="$(terraform_output_snapshot)"
+PRIMARY_PUBLIC_IP="$(terraform_output_raw deploy_primary_public_ip)"
+SECONDARY_ENABLED="$(terraform_output_raw deploy_secondary_enabled)"
+SECONDARY_PUBLIC_IP=""
+if [[ "${SECONDARY_ENABLED}" == "true" ]]; then
+  SECONDARY_PUBLIC_IP="$(terraform_output_raw deploy_secondary_public_ip)"
+fi
+APP_URL="$(terraform_output_raw app_url)"
+HEALTH_URL="$(terraform_output_raw health_url)"
+ADMIN_CIDR="$(terraform_output_raw deploy_admin_cidr)"
+APP_IMAGE_REPOSITORY="$(terraform_output_raw deploy_app_image_repository)"
+APP_IMAGE_TAG="$(terraform_output_raw deploy_app_image_tag)"
+INSTANCE_NAME="$(terraform_output_raw deploy_instance_name)"
+AWS_REGION="$(terraform_output_raw deploy_region)"
+DOMAIN="$(terraform_output_raw deploy_domain_name)"
+CADDY_EMAIL="$(terraform_output_raw deploy_caddy_email)"
 
-PUBLIC_IP="$(extract_tf_output elastic_ip)"
-APP_URL="$(extract_tf_output app_url)"
-ADMIN_CIDR="$(extract_tf_output deploy_admin_cidr)"
-APP_IMAGE_REPOSITORY="$(extract_tf_output deploy_app_image_repository)"
-APP_IMAGE_TAG="$(extract_tf_output deploy_app_image_tag)"
-DOMAIN="$(extract_tf_output deploy_domain_name)"
-CADDY_EMAIL="$(extract_tf_output deploy_caddy_email)"
+if [[ -z "${ADMIN_CIDR}" || -z "${APP_IMAGE_REPOSITORY}" || -z "${PRIMARY_PUBLIC_IP}" ]]; then
+  echo "deploy_primary_public_ip, app_image_repository, and admin_cidr must be provided either via tfvars or CLI/environment overrides." >&2
+  exit 1
+fi
 
-if [[ -z "${ADMIN_CIDR}" || -z "${APP_IMAGE_REPOSITORY}" ]]; then
-  echo "app_image_repository and admin_cidr must be provided either via tfvars or CLI/environment overrides." >&2
+if [[ "${SECONDARY_ENABLED}" == "true" && -z "${SECONDARY_PUBLIC_IP}" ]]; then
+  echo "secondary_instance_enabled is true, but Terraform did not return a secondary public IP." >&2
   exit 1
 fi
 
 echo "==> Rendering Ansible inventory"
-cat > "${ANSIBLE_DIR}/inventory.ini" <<EOF
-[app]
-${PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
-[app:vars]
-ansible_python_interpreter=/usr/bin/python3
-EOF
-
-echo "==> Waiting for SSH"
-last_ssh_error=""
-for ((i=1; i<=SSH_RETRIES; i++)); do
-  if last_ssh_error="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -i "${PRIVATE_KEY_PATH}" "ubuntu@${PUBLIC_IP}" "echo ok" 2>&1 >/dev/null)"; then
-    last_ssh_error=""
-    break
+{
+  echo "[app]"
+  echo "primary ansible_host=${PRIMARY_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\""
+  if [[ "${SECONDARY_ENABLED}" == "true" && -n "${SECONDARY_PUBLIC_IP}" ]]; then
+    echo "secondary ansible_host=${SECONDARY_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\""
   fi
+  echo
+  echo "[app:vars]"
+  echo "ansible_python_interpreter=/usr/bin/python3"
+} > "${ANSIBLE_DIR}/inventory.ini"
 
-  if (( i == SSH_RETRIES )); then
-    echo "SSH not reachable after ${SSH_RETRIES} attempts." >&2
-    if [[ -n "${last_ssh_error}" ]]; then
-      echo "Last SSH error: ${last_ssh_error}" >&2
+wait_for_host_ssh() {
+  local host_role="$1"
+  local host_ip="$2"
+  local last_ssh_error=""
+
+  echo "==> Waiting for SSH on ${host_role} (${host_ip})"
+  for ((i=1; i<=SSH_RETRIES; i++)); do
+    if last_ssh_error="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -i "${PRIVATE_KEY_PATH}" "ubuntu@${host_ip}" "echo ok" 2>&1 >/dev/null)"; then
+      last_ssh_error=""
+      return 0
     fi
-    echo "Target IP: ${PUBLIC_IP}" >&2
-    echo "Configured admin CIDR: ${ADMIN_CIDR}" >&2
-    echo "Private key path: ${PRIVATE_KEY_PATH}" >&2
-    echo "Check that your current public IP still matches the configured admin CIDR and that this private key matches the EC2 key pair." >&2
-    exit 1
-  fi
 
-  echo "SSH not ready yet (attempt ${i}/${SSH_RETRIES}); retrying in ${SSH_RETRY_DELAY_SECONDS}s..." >&2
-  sleep "${SSH_RETRY_DELAY_SECONDS}"
-done
+    if (( i == SSH_RETRIES )); then
+      echo "SSH not reachable on ${host_role} after ${SSH_RETRIES} attempts." >&2
+      if [[ -n "${last_ssh_error}" ]]; then
+        echo "Last SSH error: ${last_ssh_error}" >&2
+      fi
+      echo "Target IP: ${host_ip}" >&2
+      echo "Configured admin CIDR: ${ADMIN_CIDR}" >&2
+      echo "Private key path: ${PRIVATE_KEY_PATH}" >&2
+      echo "Check that your current public IP still matches the configured admin CIDR and that this private key matches the EC2 key pair." >&2
+      return 1
+    fi
+
+    echo "SSH not ready yet on ${host_role} (attempt ${i}/${SSH_RETRIES}); retrying in ${SSH_RETRY_DELAY_SECONDS}s..." >&2
+    sleep "${SSH_RETRY_DELAY_SECONDS}"
+  done
+}
+
+wait_for_host_ssh primary "${PRIMARY_PUBLIC_IP}"
+if [[ "${SECONDARY_ENABLED}" == "true" && -n "${SECONDARY_PUBLIC_IP}" ]]; then
+  wait_for_host_ssh secondary "${SECONDARY_PUBLIC_IP}"
+fi
 
 echo "==> Running Ansible playbook"
 EXTRA_VARS=(
   "admin_cidr=${ADMIN_CIDR}"
   "app_image_repository=${APP_IMAGE_REPOSITORY}"
   "app_image_tag=${APP_IMAGE_TAG}"
+  "cloudwatch_region=${AWS_REGION}"
+  "cloudwatch_instance_name=${INSTANCE_NAME}"
 )
 if [[ -n "${DOMAIN}" ]]; then
   EXTRA_VARS+=("domain=${DOMAIN}")
@@ -410,4 +428,10 @@ ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i "${ANSIBLE_DIR}/inventory.in
 
 echo "==> Deployment complete"
 echo "App URL: ${APP_URL}"
-echo "Health: ${APP_URL}/health"
+echo "Primary public IP: ${PRIMARY_PUBLIC_IP}"
+if [[ "${SECONDARY_ENABLED}" == "true" && -n "${SECONDARY_PUBLIC_IP}" ]]; then
+  echo "Secondary public IP: ${SECONDARY_PUBLIC_IP}"
+fi
+if [[ -n "${HEALTH_URL}" ]]; then
+  echo "Documented health URL: ${HEALTH_URL}"
+fi

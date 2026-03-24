@@ -12,6 +12,13 @@ services:
 {% endif %}
     ports:
       - "127.0.0.1:3000:3000"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: "{{ cloudwatch_region }}"
+        awslogs-group: "/{{ cloudwatch_instance_name }}/app"
+        awslogs-stream: "app-{{ inventory_hostname }}"
+        awslogs-create-group: "false"
     networks:
       - web
 
@@ -28,6 +35,13 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: "{{ cloudwatch_region }}"
+        awslogs-group: "/{{ cloudwatch_instance_name }}/caddy"
+        awslogs-stream: "caddy-{{ inventory_hostname }}"
+        awslogs-create-group: "false"
     networks:
       - web
 
