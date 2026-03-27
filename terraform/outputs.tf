@@ -60,6 +60,11 @@ output "elastic_ips" {
   value       = { for role, instance in local.monitored_instances : role => instance.public_ip }
 }
 
+output "private_ips" {
+  description = "Private IPs keyed by role."
+  value       = { for role, instance in local.monitored_instances : role => instance.private_ip }
+}
+
 output "ssh_command" {
   description = "SSH command to connect to the primary EC2 instance."
   value       = "ssh ubuntu@${aws_eip.app.public_ip}"
@@ -159,9 +164,19 @@ output "deploy_primary_public_ip" {
   value       = aws_eip.app.public_ip
 }
 
+output "deploy_primary_private_ip" {
+  description = "Primary private IP used by deploy.sh to build Caddy upstream inventory data."
+  value       = aws_instance.zwanga_api.private_ip
+}
+
 output "deploy_secondary_public_ip" {
   description = "Secondary public IP used by deploy.sh when the failover node is enabled."
   value       = try(aws_eip.app_secondary[0].public_ip, "")
+}
+
+output "deploy_secondary_private_ip" {
+  description = "Secondary private IP used by deploy.sh when the failover node is enabled."
+  value       = try(aws_instance.zwanga_api_secondary[0].private_ip, "")
 }
 
 output "deploy_secondary_enabled" {

@@ -31,6 +31,17 @@
           - (dockerhub_username | length == 0 and dockerhub_token | length == 0) or (dockerhub_username | length > 0 and dockerhub_token | length > 0)
         fail_msg: "Set both DOCKERHUB_USERNAME and DOCKERHUB_TOKEN together, or leave both unset."
 
+    - name: Validate private IP inventory data for the Caddy upstream mesh
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].private_ip is defined
+          - hostvars[item].private_ip | length > 0
+        fail_msg: "Each app host must define private_ip in the inventory."
+      loop: "{{ groups['app'] }}"
+      run_once: true
+      delegate_to: localhost
+      become: false
+
   tasks:
     - name: Update apt cache
       ansible.builtin.apt:
@@ -42,8 +53,10 @@
         name:
           - ca-certificates
           - curl
+          - fail2ban
           - gnupg
           - lsb-release
+          - unattended-upgrades
           - ufw
         state: present
 
@@ -81,13 +94,69 @@
         groups: docker
         append: true
 
+    - name: Install unattended-upgrades periodic policy
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+
+    - name: Ensure unattended-upgrades is enabled
+      ansible.builtin.service:
+        name: unattended-upgrades
+        state: started
+        enabled: true
+
+    - name: Install fail2ban SSH jail
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          banaction = ufw
+          maxretry = 5
+          findtime = 10m
+          bantime = 1h
+      notify: Restart fail2ban
+
+    - name: Install SSH hardening override
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-zwanga-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+          X11Forwarding no
+          MaxAuthTries 3
+          LoginGraceTime 30
+      notify: Restart ssh
+
+    - name: Ensure fail2ban is enabled and running
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: true
+
     - name: Ensure application directory exists
       ansible.builtin.file:
         path: "{{ app_dir }}"
         state: directory
         owner: "{{ deploy_user }}"
         group: "{{ deploy_user }}"
-        mode: "0755"
+        mode: "0750"
 
     - name: Render docker-compose
       ansible.builtin.template:
@@ -95,7 +164,7 @@
         dest: "{{ app_dir }}/docker-compose.yml"
         owner: "{{ deploy_user }}"
         group: "{{ deploy_user }}"
-        mode: "0644"
+        mode: "0640"
 
     - name: Render Caddyfile
       ansible.builtin.template:
@@ -103,7 +172,7 @@
         dest: "{{ app_dir }}/Caddyfile"
         owner: "{{ deploy_user }}"
         group: "{{ deploy_user }}"
-        mode: "0644"
+        mode: "0640"
 
     - name: Copy app env file when provided
       ansible.builtin.copy:
@@ -198,8 +267,15 @@
     - name: Default allow outgoing
       ansible.builtin.command: ufw default allow outgoing
 
+    - name: Set UFW logging to low
+      ansible.builtin.command: ufw logging low
+
     - name: Allow SSH only from personal IP
       ansible.builtin.command: "ufw allow from {{ admin_cidr }} to any port 22 proto tcp"
+
+    - name: Allow private Caddy-to-app traffic on port 3000
+      ansible.builtin.command: "ufw allow from {{ hostvars[item].private_ip }} to any port 3000 proto tcp"
+      loop: "{{ groups['app'] }}"
 
     - name: Allow HTTP
       ansible.builtin.command: ufw allow 80/tcp
@@ -210,10 +286,24 @@
     - name: Enable UFW
       ansible.builtin.command: ufw --force enable
 
-    - name: Reset SSH connection after firewall changes
+    - name: Apply pending SSH/fail2ban restarts before reconnecting
+      ansible.builtin.meta: flush_handlers
+
+    - name: Reset SSH connection after firewall and SSH hardening changes
       ansible.builtin.meta: reset_connection
 
     - name: Confirm SSH after firewall changes
       ansible.builtin.wait_for_connection:
         delay: 2
         timeout: 60
+
+  handlers:
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted

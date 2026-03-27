@@ -35,6 +35,7 @@ Do this before any incident happens:
 - deploy the same image tag to both nodes
 - deploy the same `.env` content to both nodes
 - confirm both nodes can start the stack cleanly
+- confirm the active node's Caddy can still reach the peer app over private port `3000`
 - confirm CloudWatch logs arrive for `primary` and `secondary`
 - if you configured `alarm_email_endpoints`, confirm the subscription emails were accepted
 
@@ -79,10 +80,12 @@ Fail over when the primary node is no longer a safe serving target.
 Typical triggers:
 
 - EC2 instance unreachable
-- repeated app crash on the primary only
+- repeated Caddy or host-level failure on the current public node
 - persistent system status check failures
-- networking issue isolated to the primary node
-- manual maintenance window where the primary must be taken out of service
+- networking issue isolated to the current public node
+- manual maintenance window where the current public node must be taken out of service
+
+If only the primary app container is unhealthy but the primary node and Caddy are still up, Caddy may continue serving traffic through the secondary app over the private upstream mesh. Validate that path before forcing DNS failover.
 
 ## 5. Failover Procedure
 
@@ -109,6 +112,7 @@ You want to see:
 - `nestjs-app` running
 - `caddy` running
 - no obvious startup errors in app logs
+- no upstream connectivity errors in Caddy logs
 
 ### Step 3: Update the external DNS record
 

@@ -1,15 +1,17 @@
 # Zwanga Infra
 
-This repository provisions a low-cost active-passive AWS deployment for the Zwanga Nest.js API.
-Terraform creates the infrastructure, then Ansible deploys a prebuilt Docker Hub image behind Caddy on one primary EC2 node and one secondary failover EC2 node.
+This repository provisions a low-cost two-node AWS deployment for the Zwanga Nest.js API.
+Terraform creates the infrastructure, then Ansible deploys the same Docker Hub image on a primary and secondary EC2 node. Each node runs Caddy, and the public Caddy entry point load balances across both Nest.js instances over private VPC traffic.
 
 ## Architecture
 
 ```text
 Internet
   -> External DNS provider
-     -> Primary public IP   -> EC2 primary   -> Caddy -> Nest.js image
-     -> Secondary public IP -> EC2 secondary -> Caddy -> Nest.js image
+     -> Active public IP (primary or secondary)
+        -> Caddy on the active node
+           -> local Nest.js container
+           -> peer Nest.js container over private IP
 ```
 
 What this repo now provisions by default:
@@ -28,6 +30,7 @@ What this repo now provisions by default:
 The design goal is simple:
 
 - keep the stack inexpensive
+- use Caddy as the application-layer load balancer between the two EC2 nodes
 - avoid the biggest single point of failure of a single EC2 node
 - stay compatible with an external DNS provider instead of Route 53
 
@@ -70,17 +73,29 @@ The Terraform S3 backend does not belong in `terraform.tfvars`.
 Terraform reads the backend during `terraform init`, before it loads normal input variables.
 That is why the S3 bucket has to live in a dedicated backend file or in `-backend-config` arguments.
 
+This repository is now aligned on a Frankfurt deployment with native S3 state locking.
+That means you can use an S3 backend file with `use_lockfile = true` and skip the DynamoDB lock table entirely.
+
 Use [`terraform/backend.hcl`](terraform/backend.hcl) locally, or create it from [`terraform/backend.hcl.example`](terraform/backend.hcl.example).
 
-Example:
+Current example:
 
 ```hcl
-bucket  = "my-tf-state-bucket"
-key     = "zwanga/terraform.tfstate"
-region  = "us-east-1"
-encrypt = true
-# dynamodb_table = "my-tf-lock-table"
+bucket       = "zwanga-tfstates"
+key          = "zwanga/eu-central-1/terraform.tfstate"
+region       = "eu-central-1"
+encrypt      = true
+use_lockfile = true
 ```
+
+How it works:
+
+- Terraform creates and removes a `.tflock` object in the S3 backend automatically
+- locking happens automatically on write operations such as `apply`
+- if a lock gets stuck, use `terraform force-unlock <LOCK_ID>` carefully
+- a DynamoDB lock table is no longer required for this setup
+
+HashiCorp docs: [Terraform state locking](https://developer.hashicorp.com/terraform/language/state/locking)
 
 ## Local Deployment
 
@@ -94,17 +109,18 @@ CLI flags or environment variables can override those values.
 Example:
 
 ```bash
-PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+PRIVATE_KEY_PATH=~/.ssh/zwanga-keys.pem \
 ./deploy.sh
 ```
 
 If you prefer not to use `terraform/backend.hcl`, you can still pass backend values explicitly:
 
 ```bash
-TF_STATE_BUCKET=my-tf-state-bucket \
-TF_STATE_KEY=zwanga/terraform.tfstate \
-TF_STATE_REGION=us-east-1 \
-PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+TF_STATE_BUCKET=zwanga-tfstates \
+TF_STATE_KEY=zwanga/eu-central-1/terraform.tfstate \
+TF_STATE_REGION=eu-central-1 \
+TF_BACKEND_USE_LOCKFILE=true \
+PRIVATE_KEY_PATH=~/.ssh/zwanga-keys.pem \
 ./deploy.sh
 ```
 
@@ -112,7 +128,7 @@ Override the image tag directly when you want to deploy a specific build:
 
 ```bash
 APP_IMAGE_TAG=2026-03-23-sha123 \
-PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+PRIVATE_KEY_PATH=~/.ssh/zwanga-keys.pem \
 ./deploy.sh
 ```
 
@@ -120,11 +136,11 @@ Inject an app env file from your workstation without going through GitHub Action
 
 ```bash
 APP_ENV_FILE=./app/.env.production \
-PRIVATE_KEY_PATH=~/.ssh/zwanga.pem \
+PRIVATE_KEY_PATH=~/.ssh/zwanga-keys.pem \
 ./deploy.sh
 ```
 
-`deploy.sh` now builds an Ansible inventory with a `primary` host and, when enabled, a `secondary` host.
+`deploy.sh` now builds an Ansible inventory with a `primary` host and, when enabled, a `secondary` host, including each node's private IP so Caddy can build its upstream mesh. The deploy script also uses `StrictHostKeyChecking=accept-new` during the run instead of disabling host-key checks entirely.
 The playbook deploys serially to reduce blast radius during rollouts.
 
 ## External DNS Strategy
@@ -134,9 +150,10 @@ This stack intentionally assumes your DNS is hosted outside AWS.
 Recommended setup:
 
 - create a public record such as `api.example.com`
-- point it to the primary Elastic IP in normal operation
+- simplest mode: point it to the primary Elastic IP in normal operation; that node's Caddy will still round-robin traffic across both app instances
 - keep the secondary Elastic IP documented as the standby target
 - set a low TTL, typically `60` or `120` seconds
+- if your DNS provider supports weighted, multi-value, or health-checked records, you can publish both public IPs for more even edge distribution
 - if your DNS provider supports automated failover/health checks, use the two Terraform outputs as primary/secondary targets
 - otherwise use the manual runbook in [`docs/manual-failover-runbook.md`](docs/manual-failover-runbook.md)
 
@@ -151,6 +168,7 @@ Terraform outputs expose the values you need:
 
 Caddy automatically serves HTTPS only when `domain_name` is configured.
 If `domain_name` is empty, Caddy serves plain HTTP on port 80.
+Each public Caddy node uses round-robin load balancing with retries and passive failure detection across the local and peer Nest.js containers.
 
 For HTTPS:
 
@@ -201,7 +219,7 @@ GitHub Actions variables:
 - `TF_STATE_BUCKET` optional if you use `TF_BACKEND_CONFIG_CONTENT`
 - `TF_STATE_KEY` optional
 - `TF_STATE_REGION` optional
-- `TF_LOCK_TABLE` optional
+- `TF_LOCK_TABLE` optional legacy fallback if you still use DynamoDB locking
 - `APP_IMAGE_REPOSITORY` optional if already present inside `TFVARS_CONTENT`
 - `APP_IMAGE_TAG` optional, defaults to `latest`
 - `DOCKERHUB_USERNAME` optional, needed for Docker image publishing or private image pulls

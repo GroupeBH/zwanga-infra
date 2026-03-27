@@ -140,6 +140,14 @@ resource "aws_security_group" "web" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "Private app traffic between cluster nodes"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    self        = true
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -200,6 +208,18 @@ resource "aws_instance" "zwanga_api" {
               apt-get install -y python3 python3-apt
               EOF
 
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+
+  root_block_device {
+    encrypted   = true
+    volume_type = "gp3"
+  }
+
   tags = {
     Name = var.instance_name
     Role = "primary"
@@ -223,6 +243,18 @@ resource "aws_instance" "zwanga_api_secondary" {
               apt-get update -y
               apt-get install -y python3 python3-apt
               EOF
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "disabled"
+  }
+
+  root_block_device {
+    encrypted   = true
+    volume_type = "gp3"
+  }
 
   tags = {
     Name = "${var.instance_name}-secondary"
@@ -281,6 +313,7 @@ locals {
     {
       primary = {
         id              = aws_instance.zwanga_api.id
+        private_ip      = aws_instance.zwanga_api.private_ip
         public_ip       = aws_eip.app.public_ip
         availability_az = aws_instance.zwanga_api.availability_zone
       }
@@ -288,6 +321,7 @@ locals {
     var.secondary_instance_enabled ? {
       secondary = {
         id              = aws_instance.zwanga_api_secondary[0].id
+        private_ip      = aws_instance.zwanga_api_secondary[0].private_ip
         public_ip       = aws_eip.app_secondary[0].public_ip
         availability_az = aws_instance.zwanga_api_secondary[0].availability_zone
       }

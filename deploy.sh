@@ -23,10 +23,25 @@ TF_BACKEND_CONFIG_FILE="${TF_BACKEND_CONFIG_FILE:-${TF_DIR}/backend.hcl}"
 TF_STATE_BUCKET="${TF_STATE_BUCKET:-}"
 TF_STATE_KEY="${TF_STATE_KEY:-}"
 TF_STATE_REGION="${TF_STATE_REGION:-}"
+TF_BACKEND_USE_LOCKFILE="${TF_BACKEND_USE_LOCKFILE:-true}"
 TF_LOCK_TABLE="${TF_LOCK_TABLE:-}"
 SSH_RETRIES="${SSH_RETRIES:-30}"
 SSH_RETRY_DELAY_SECONDS="${SSH_RETRY_DELAY_SECONDS:-10}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-5}"
+TF_CLI_CONFIG_FILE=""
+SSH_KNOWN_HOSTS_FILE=""
+
+cleanup() {
+  if [[ -n "${TF_CLI_CONFIG_FILE}" && -f "${TF_CLI_CONFIG_FILE}" ]]; then
+    rm -f "${TF_CLI_CONFIG_FILE}"
+  fi
+
+  if [[ -n "${SSH_KNOWN_HOSTS_FILE}" && -f "${SSH_KNOWN_HOSTS_FILE}" ]]; then
+    rm -f "${SSH_KNOWN_HOSTS_FILE}"
+  fi
+}
+
+trap cleanup EXIT
 
 usage() {
   cat <<EOF
@@ -49,6 +64,7 @@ Usage:
     [--tf-state-bucket <s3_bucket>] \
     [--tf-state-key <state_key>] \
     [--tf-state-region <region>] \
+    [--tf-backend-use-lockfile <true|false>] \
     [--tf-lock-table <dynamodb_table>]
 
 terraform/terraform.tfvars is loaded automatically when present.
@@ -59,7 +75,7 @@ Environment variable alternatives are also supported:
   AWS_REGION, KEY_NAME, PRIVATE_KEY_PATH, ADMIN_CIDR, DOMAIN, CADDY_EMAIL, INSTANCE_NAME,
   INSTANCE_TYPE, APP_IMAGE_REPOSITORY, APP_IMAGE_TAG, APP_ENV_FILE, APP_HEALTHCHECK_PATH,
   TF_VARS_FILE, TF_BACKEND_CONFIG_FILE, TF_STATE_BUCKET, TF_STATE_KEY, TF_STATE_REGION,
-  TF_LOCK_TABLE, SSH_RETRIES, SSH_RETRY_DELAY_SECONDS, SSH_CONNECT_TIMEOUT
+  TF_BACKEND_USE_LOCKFILE, TF_LOCK_TABLE, SSH_RETRIES, SSH_RETRY_DELAY_SECONDS, SSH_CONNECT_TIMEOUT
 EOF
 }
 
@@ -131,6 +147,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --tf-state-region)
       TF_STATE_REGION="$2"
+      shift 2
+      ;;
+    --tf-backend-use-lockfile)
+      TF_BACKEND_USE_LOCKFILE="$2"
       shift 2
       ;;
     --tf-lock-table)
@@ -212,6 +232,11 @@ if [[ "${APP_HEALTHCHECK_PATH}" != /* ]]; then
   exit 1
 fi
 
+if [[ "${TF_BACKEND_USE_LOCKFILE}" != "true" && "${TF_BACKEND_USE_LOCKFILE}" != "false" ]]; then
+  echo "TF_BACKEND_USE_LOCKFILE must be true or false: ${TF_BACKEND_USE_LOCKFILE}" >&2
+  exit 1
+fi
+
 TF_PROVIDER_MIRROR_DIR="${TF_DIR}/.terraform/providers"
 shopt -s nullglob
 aws_provider_binaries=("${TF_PROVIDER_MIRROR_DIR}"/registry.terraform.io/hashicorp/aws/*/*/terraform-provider-aws_*)
@@ -230,11 +255,10 @@ provider_installation {
 }
 EOF
   export TF_CLI_CONFIG_FILE
-  trap 'rm -f "${TF_CLI_CONFIG_FILE}"' EXIT
 fi
 
-DEFAULT_TF_STATE_KEY="zwanga/terraform.tfstate"
-DEFAULT_TF_STATE_REGION="${AWS_REGION:-us-east-1}"
+DEFAULT_TF_STATE_KEY="zwanga/${AWS_REGION:-eu-central-1}/terraform.tfstate"
+DEFAULT_TF_STATE_REGION="${AWS_REGION:-eu-central-1}"
 if [[ "${HAS_BACKEND_FILE}" -eq 0 ]]; then
   TF_STATE_KEY="${TF_STATE_KEY:-${DEFAULT_TF_STATE_KEY}}"
   TF_STATE_REGION="${TF_STATE_REGION:-${DEFAULT_TF_STATE_REGION}}"
@@ -294,6 +318,7 @@ if [[ -n "${TF_STATE_REGION}" ]]; then
   INIT_ARGS+=("-backend-config=region=${TF_STATE_REGION}")
 fi
 INIT_ARGS+=("-backend-config=encrypt=true")
+INIT_ARGS+=("-backend-config=use_lockfile=${TF_BACKEND_USE_LOCKFILE}")
 if [[ -n "${TF_LOCK_TABLE}" ]]; then
   INIT_ARGS+=("-backend-config=dynamodb_table=${TF_LOCK_TABLE}")
 fi
@@ -333,10 +358,13 @@ terraform_output_raw() {
 
 echo "==> Loading Terraform outputs"
 PRIMARY_PUBLIC_IP="$(terraform_output_raw deploy_primary_public_ip)"
+PRIMARY_PRIVATE_IP="$(terraform_output_raw deploy_primary_private_ip)"
 SECONDARY_ENABLED="$(terraform_output_raw deploy_secondary_enabled)"
 SECONDARY_PUBLIC_IP=""
+SECONDARY_PRIVATE_IP=""
 if [[ "${SECONDARY_ENABLED}" == "true" ]]; then
   SECONDARY_PUBLIC_IP="$(terraform_output_raw deploy_secondary_public_ip)"
+  SECONDARY_PRIVATE_IP="$(terraform_output_raw deploy_secondary_private_ip)"
 fi
 APP_URL="$(terraform_output_raw app_url)"
 HEALTH_URL="$(terraform_output_raw health_url)"
@@ -348,22 +376,26 @@ AWS_REGION="$(terraform_output_raw deploy_region)"
 DOMAIN="$(terraform_output_raw deploy_domain_name)"
 CADDY_EMAIL="$(terraform_output_raw deploy_caddy_email)"
 
-if [[ -z "${ADMIN_CIDR}" || -z "${APP_IMAGE_REPOSITORY}" || -z "${PRIMARY_PUBLIC_IP}" ]]; then
-  echo "deploy_primary_public_ip, app_image_repository, and admin_cidr must be provided either via tfvars or CLI/environment overrides." >&2
+if [[ -z "${ADMIN_CIDR}" || -z "${APP_IMAGE_REPOSITORY}" || -z "${PRIMARY_PUBLIC_IP}" || -z "${PRIMARY_PRIVATE_IP}" ]]; then
+  echo "deploy_primary_public_ip, deploy_primary_private_ip, app_image_repository, and admin_cidr must be provided either via tfvars or CLI/environment overrides." >&2
   exit 1
 fi
 
-if [[ "${SECONDARY_ENABLED}" == "true" && -z "${SECONDARY_PUBLIC_IP}" ]]; then
-  echo "secondary_instance_enabled is true, but Terraform did not return a secondary public IP." >&2
+if [[ "${SECONDARY_ENABLED}" == "true" && ( -z "${SECONDARY_PUBLIC_IP}" || -z "${SECONDARY_PRIVATE_IP}" ) ]]; then
+  echo "secondary_instance_enabled is true, but Terraform did not return both public and private IPs for the secondary node." >&2
   exit 1
 fi
+
+SSH_KNOWN_HOSTS_FILE="$(mktemp)"
+chmod 600 "${SSH_KNOWN_HOSTS_FILE}"
+ANSIBLE_SSH_COMMON_ARGS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${SSH_KNOWN_HOSTS_FILE}"
 
 echo "==> Rendering Ansible inventory"
 {
   echo "[app]"
-  echo "primary ansible_host=${PRIMARY_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\""
+  echo "primary ansible_host=${PRIMARY_PUBLIC_IP} private_ip=${PRIMARY_PRIVATE_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"${ANSIBLE_SSH_COMMON_ARGS}\""
   if [[ "${SECONDARY_ENABLED}" == "true" && -n "${SECONDARY_PUBLIC_IP}" ]]; then
-    echo "secondary ansible_host=${SECONDARY_PUBLIC_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\""
+    echo "secondary ansible_host=${SECONDARY_PUBLIC_IP} private_ip=${SECONDARY_PRIVATE_IP} ansible_user=ubuntu ansible_ssh_private_key_file=${PRIVATE_KEY_PATH} ansible_ssh_common_args=\"${ANSIBLE_SSH_COMMON_ARGS}\""
   fi
   echo
   echo "[app:vars]"
@@ -374,10 +406,17 @@ wait_for_host_ssh() {
   local host_role="$1"
   local host_ip="$2"
   local last_ssh_error=""
+  local -a ssh_options=(
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    -o UserKnownHostsFile="${SSH_KNOWN_HOSTS_FILE}"
+    -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}"
+    -i "${PRIVATE_KEY_PATH}"
+  )
 
   echo "==> Waiting for SSH on ${host_role} (${host_ip})"
   for ((i=1; i<=SSH_RETRIES; i++)); do
-    if last_ssh_error="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -i "${PRIVATE_KEY_PATH}" "ubuntu@${host_ip}" "echo ok" 2>&1 >/dev/null)"; then
+    if last_ssh_error="$(ssh "${ssh_options[@]}" "ubuntu@${host_ip}" "echo ok" 2>&1 >/dev/null)"; then
       last_ssh_error=""
       return 0
     fi
