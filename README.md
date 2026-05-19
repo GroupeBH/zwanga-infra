@@ -81,7 +81,7 @@ Use [`terraform/backend.hcl`](terraform/backend.hcl) locally, or create it from 
 Current example:
 
 ```hcl
-bucket       = "zwanga-tfstates"
+bucket       = "tfstates-zwanga"
 key          = "zwanga/eu-central-1/terraform.tfstate"
 region       = "eu-central-1"
 encrypt      = true
@@ -116,7 +116,7 @@ PRIVATE_KEY_PATH=~/.ssh/zwanga-keys.pem \
 If you prefer not to use `terraform/backend.hcl`, you can still pass backend values explicitly:
 
 ```bash
-TF_STATE_BUCKET=zwanga-tfstates \
+TF_STATE_BUCKET=tfstates-zwanga \
 TF_STATE_KEY=zwanga/eu-central-1/terraform.tfstate \
 TF_STATE_REGION=eu-central-1 \
 TF_BACKEND_USE_LOCKFILE=true \
